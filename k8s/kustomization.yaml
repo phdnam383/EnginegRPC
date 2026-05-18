@@ -1,0 +1,42 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Kustomization — deploy all resources with a single command
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Usage
+# -----
+#   # Preview what will be applied:
+#   kubectl kustomize k8s/
+#
+#   # Apply to the cluster:
+#   kubectl apply -k k8s/
+#
+#   # Delete all resources:
+#   kubectl delete -k k8s/
+#
+# Image override (CI/CD)
+# ----------------------
+#   kubectl apply -k k8s/ --dry-run=client \
+#     && kustomize edit set image alarm-cluster-engine=<YOUR_REGISTRY>/alarm-cluster-engine:<TAG>
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: default   # Change to your target namespace
+
+resources:
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+
+# ── Image tag override ────────────────────────────────────────────────────────
+# Uncomment and update in CI/CD pipelines instead of editing deployment.yaml:
+# images:
+#   - name: <YOUR_REGISTRY>/alarm-cluster-engine
+#     newTag: "1.0.0"
+
+# ── Common labels applied to all resources ────────────────────────────────────
+commonLabels:
+  managed-by: kustomize
+  component:  alarm-cluster-engine

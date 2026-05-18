@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package alarm_clustering;
+
+// ── Service ────────────────────────────────────────────────────────────────────
+service AlarmClusteringService {
+    rpc AnalyzeOnlineAlarmCluster(AnalyzeOnlineAlarmClusterRequest)
+        returns (OnlineAlarmClusterReport);
+}
+
+// ── Request ────────────────────────────────────────────────────────────────────
+message AlarmRecord {
+    string _source_id                = 1;
+    string managed_objects            = 2;
+    string alarmType         = 3;
+    string probable_cause     = 4;
+    string perceived_severity = 5;
+    string state             = 6;
+    string created_at        = 7;
+    string closed_at       = 8;
+}
+
+message AnalyzeOnlineAlarmClusterRequest {
+    string requestId                  = 1;
+    string system                     = 2;
+    repeated AlarmRecord alarmRecords = 3;
+}
+
+// ── Response ───────────────────────────────────────────────────────────────────
+message OnlineAlarmClusterResult {
+    string _source_id = 1;
+    int32  clusterId  = 2;
+    float  confidence = 3;
+}
+
+message OnlineAlarmClusterReport {
+    string requestId                          = 1;
+    string reportType                         = 2;
+    string status                             = 3;
+    string message                            = 4;
+    repeated OnlineAlarmClusterResult results = 5;
+}

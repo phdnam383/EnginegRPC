@@ -1,0 +1,14 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# PodDisruptionBudget — guarantee availability during node drain / upgrades
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alarm-cluster-engine-pdb
+  labels:
+    app: alarm-cluster-engine
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: alarm-cluster-engine

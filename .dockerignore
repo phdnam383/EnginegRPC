@@ -1,0 +1,29 @@
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Development / scratch files ───────────────────────────────────────────────
+_smoke_test.py
+data/
+output/
+
+# ── Model artefacts that are NOT needed (TSV for TF Projector, plot) ──────────
+models/vectors.tsv
+models/metadata.tsv
+models/loss_curve.png
+
+# ── Git & IDE ─────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# ── Docs & notebooks ──────────────────────────────────────────────────────────
+*.md
+*.ipynb
+
+# ── Test client (not needed in the server image) ──────────────────────────────
+test_client.py

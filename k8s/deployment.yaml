@@ -1,0 +1,131 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Deployment — Alarm Cluster Engine (gRPC server)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Before applying:
+#   1. Build & push the image:
+#        docker build -t <YOUR_REGISTRY>/alarm-cluster-engine:latest .
+#        docker push <YOUR_REGISTRY>/alarm-cluster-engine:latest
+#   2. Replace <YOUR_REGISTRY> in this file with your actual registry path.
+#   3. kubectl apply -k k8s/
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alarm-cluster-engine
+  labels:
+    app: alarm-cluster-engine
+    version: "1.0.0"
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: alarm-cluster-engine
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # Zero-downtime rollout
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app: alarm-cluster-engine
+        version: "1.0.0"
+
+    spec:
+      # ── Security ─────────────────────────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      # ── Graceful shutdown: allow in-flight gRPC calls to complete ─────────────
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: alarm-cluster-engine
+          image: <YOUR_REGISTRY>/alarm-cluster-engine:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+
+          # ── Environment from ConfigMap ────────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: alarm-cluster-engine-config
+
+          # ── Resource limits ───────────────────────────────────────────────────
+          resources:
+            requests:
+              cpu:    "250m"
+              memory: "256Mi"
+            limits:
+              cpu:    "1000m"
+              memory: "512Mi"
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # Restarts the pod if the process hangs (HTTP /live always 200 if alive)
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # Removes pod from Service endpoints until embedder is loaded & gRPC is up
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # ── Startup probe ─────────────────────────────────────────────────────
+          # Gives up to 60s for the first startup (model loading) before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: health
+            failureThreshold: 12
+            periodSeconds: 5
+            timeoutSeconds: 5
+
+          # ── Volume mount (optional — only needed with hot-swappable PVC model) ──
+          # volumeMounts:
+          #   - name: model-volume
+          #     mountPath: /app/models
+          #     readOnly: true
+
+      # ── Volumes (uncomment to enable PVC-based model hot-swap) ───────────────
+      # volumes:
+      #   - name: model-volume
+      #     persistentVolumeClaim:
+      #       claimName: alarm-cluster-model-pvc
+
+      # ── Pod disruption: keep at least 1 replica always available ─────────────
+      # (declared separately in pdb.yaml)
+
+      # ── Anti-affinity: spread replicas across nodes ───────────────────────────
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: alarm-cluster-engine
+                topologyKey: kubernetes.io/hostname

@@ -1,0 +1,29 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# PersistentVolumeClaim — shared storage for embedding model files
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Purpose
+# -------
+# Provides a writable volume at /app/models where embeddings.npz lives.
+# When the model is retrained, upload the new embeddings.npz to this PVC
+# (e.g. via a Job or kubectl cp) and perform a rolling restart — no image
+# rebuild required.
+#
+# Usage (optional)
+# ----------------
+# By default, embeddings.npz is baked into the Docker image (Dockerfile).
+# Mount this PVC in deployment.yaml only if you want hot-swappable models.
+# ══════════════════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alarm-cluster-model-pvc
+  labels:
+    app: alarm-cluster-engine
+spec:
+  accessModes:
+    - ReadOnlyMany        # Multiple pods can read concurrently
+  resources:
+    requests:
+      storage: 100Mi      # ~215 KB needed; 100 Mi gives plenty of headroom
+  # storageClassName: standard   # Uncomment and set to your cluster's StorageClass
