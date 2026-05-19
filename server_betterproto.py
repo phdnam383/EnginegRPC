@@ -2,10 +2,8 @@
 server_betterproto.py — gRPC server dùng BetterProto types.
 
 Cấu hình qua biến môi trường:
-    GRPC_PORT   (default: 50051)
-    MODEL_DIR   (default: models)
-
-K8s health probe: dùng TCP socket vào GRPC_PORT thay vì HTTP.
+    GRPC_PORT  (default: 50051)
+    MODEL_DIR  (default: models)
 """
 
 import asyncio
@@ -24,7 +22,6 @@ from proto_betterproto.engine import (
     OnlineAlarmClusterReport,
     OnlineAlarmClusterResult,
 )
-from proto_betterproto.grpcio_support import add_to_server
 from embedder import Embedder
 from online_clustering import cluster_online, OnlineClusteringResult
 
@@ -34,6 +31,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# ── gRPC registration ──────────────────────────────────────────────────────────
+
+def add_to_server(servicer, server: grpc.aio.Server) -> None:
+    handlers = {
+        "AnalyzeOnlineAlarmCluster": grpc.unary_unary_rpc_method_handler(
+            servicer.analyze_online_alarm_cluster,
+            request_deserializer=AnalyzeOnlineAlarmClusterRequest.FromString,
+            response_serializer=bytes,
+        ),
+    }
+    server.add_generic_rpc_handlers([
+        grpc.method_handlers_generic_handler(
+            "alarm_clustering.AlarmClusteringService", handlers
+        )
+    ])
+
+
+# ── Servicer ───────────────────────────────────────────────────────────────────
 
 class AlarmClusteringServicer:
 
@@ -80,7 +96,6 @@ class AlarmClusteringServicer:
                 ],
             )
 
-        # cluster_online блокирует CPU — запускаем в thread pool
         loop = asyncio.get_event_loop()
         try:
             result: OnlineClusteringResult = await loop.run_in_executor(None, cluster_online, records)
@@ -113,6 +128,8 @@ class AlarmClusteringServicer:
             ],
         )
 
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     port = int(os.environ.get("GRPC_PORT", 50051))
