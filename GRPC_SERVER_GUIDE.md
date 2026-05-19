@@ -1,94 +1,96 @@
-# Xây dựng gRPC Server — Alarm Cluster Engine
+# Hướng Dẫn Xây Dựng gRPC Server với BetterProto (Python)
+
+> Hướng dẫn này được viết dựa trên **project AlarmClusterEngine** thực tế.  
+> So sánh song song giữa hai cách tiếp cận: `grpc_tools.protoc` (classic) và `betterproto` (modern).
+
+---
 
 ## Mục lục
 
-1. [gRPC là gì?](#1-grpc-là-gì)
-2. [Tổng quan kiến trúc](#2-tổng-quan-kiến-trúc)
-3. [Bước 1 — Định nghĩa Contract với Protocol Buffers](#3-bước-1--định-nghĩa-contract-với-protocol-buffers)
-4. [Bước 2 — Generate Python Stubs](#4-bước-2--generate-python-stubs)
-5. [Bước 3 — Implement Servicer (Business Logic)](#5-bước-3--implement-servicer-business-logic)
+1. [Tổng quan kiến trúc](#1-tổng-quan-kiến-trúc)
+2. [Cài đặt dependencies](#2-cài-đặt-dependencies)
+3. [Bước 1 — Định nghĩa hợp đồng (.proto)](#3-bước-1--định-nghĩa-hợp-đồng-proto)
+4. [Bước 2 — Sinh Python stubs](#4-bước-2--sinh-python-stubs)
+5. [Bước 3 — Triển khai Servicer](#5-bước-3--triển-khai-servicer)
 6. [Bước 4 — Khởi động Server](#6-bước-4--khởi-động-server)
-7. [Bước 5 — Implement Client](#7-bước-5--implement-client)
-8. [Luồng xử lý request đầy đủ](#8-luồng-xử-lý-request-đầy-đủ)
-9. [Error handling & Status codes](#9-error-handling--status-codes)
-10. [Health Probes cho Kubernetes](#10-health-probes-cho-kubernetes)
-11. [Chạy và kiểm thử](#11-chạy-và-kiểm-thử)
+7. [Bước 5 — HTTP Health Probe](#7-bước-5--http-health-probe)
+8. [Bước 6 — Graceful Shutdown](#8-bước-6--graceful-shutdown)
+9. [Bước 7 — CLI Entry-Point](#9-bước-7--cli-entry-point)
+10. [Sơ đồ luồng hoàn chỉnh](#10-sơ-đồ-luồng-hoàn-chỉnh)
+11. [Bảng so sánh classic vs betterproto](#11-bảng-so-sánh-classic-vs-betterproto)
+12. [Các lỗi thường gặp](#12-các-lỗi-thường-gặp)
 
 ---
 
-## 1. gRPC là gì?
+## 1. Tổng quan kiến trúc
 
-**gRPC** (Google Remote Procedure Call) là framework cho phép hai service gọi hàm của nhau qua mạng như thể gọi hàm local.
+```
+┌─────────────────────────────────────────────────────────┐
+│                  AlarmClusterEngine                     │
+│                                                         │
+│  proto/engine.proto                                     │
+│        │                                                │
+│        ▼ (generate_betterproto.py)                      │
+│  proto_betterproto/engine.py   ◄── BetterProto stubs   │
+│        │                                                │
+│        ▼                                                │
+│  server_betterproto.py                                  │
+│  ├── _HealthHandler     (HTTP /live /ready /health)     │
+│  ├── AlarmClusteringServicer  (gRPC handler)            │
+│  └── serve()            (asyncio event loop)            │
+│                                                         │
+│  PORT 50051  ◄── gRPC (grpc.aio)                        │
+│  PORT 8080   ◄── HTTP health probes                     │
+└─────────────────────────────────────────────────────────┘
+```
 
-So sánh với REST:
+### Hai cách sinh stubs
 
-| | REST/HTTP | gRPC |
-|---|---|---|
-| **Protocol** | HTTP/1.1 | HTTP/2 |
-| **Format** | JSON (text) | Protobuf (binary) |
-| **Contract** | OpenAPI (tuỳ chọn) | `.proto` (bắt buộc) |
-| **Performance** | Chậm hơn | Nhanh hơn ~5–10× |
-| **Streaming** | Không native | Có (4 kiểu) |
-| **Code gen** | Tuỳ tool | Built-in |
-
-**Trong project này**: MDAF Logic gọi `AnalyzeOnlineAlarmCluster()` trên Alarm Cluster Engine như gọi hàm Python bình thường — gRPC lo toàn bộ serialization, network, và error handling.
+| Cách | Tool | Output | Kiểu message | RPC style |
+|------|------|--------|--------------|-----------|
+| Classic | `grpc_tools.protoc` | `engine_pb2.py` + `engine_pb2_grpc.py` | raw descriptor | sync |
+| **BetterProto** | `betterproto[compiler]` | `proto_betterproto/engine.py` | `@dataclass` | **async** |
 
 ---
 
-## 2. Tổng quan kiến trúc
+## 2. Cài đặt dependencies
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  MDAF Logic (Client)                                            │
-│                                                                 │
-│   stub = AlarmClusteringServiceStub(channel)                    │
-│   report = stub.AnalyzeOnlineAlarmCluster(request)  ──────────► │
-└─────────────────────────────────────────────────────────────────┘
-                          gRPC / HTTP2 / Protobuf
-                          port 50051
-┌─────────────────────────────────────────────────────────────────┐
-│  Alarm Cluster Engine (Server)                                  │
-│                                                                 │
-│   AlarmClusteringServicer                                       │
-│     └─ AnalyzeOnlineAlarmCluster(request, context)             │
-│           ├─ 1. Tokenise alarms                                 │
-│           ├─ 2. Lookup embedding (Embedder)                     │
-│           ├─ 3. DBSCAN clustering (online_clustering)           │
-│           └─ 4. Return OnlineAlarmClusterReport  ◄─────────────│
-└─────────────────────────────────────────────────────────────────┘
+### `requirements.txt`
+
+```txt
+grpcio>=1.62.0
+grpcio-tools>=1.62.0
+betterproto[compiler]>=0.3.1
 ```
 
-**Các file liên quan:**
+- **`grpcio`** — runtime gRPC cho Python (client/server transport layer)
+- **`grpcio-tools`** — cung cấp `grpc_tools.protoc`, compiler cho `.proto` → Python
+- **`betterproto[compiler]`** — plugin cho protoc, sinh `@dataclass` thay vì raw descriptor; phần `[compiler]` bao gồm `grpclib` và plugin
 
-```
-proto/engine.proto          ← Contract (nguồn sự thật duy nhất)
-proto/engine_pb2.py         ← Message classes (auto-generated)
-proto/engine_pb2_grpc.py    ← Stub + Servicer base (auto-generated)
-server.py                   ← Server implementation
-test_client.py              ← Client implementation
-embedder.py                 ← Embedding lookup
-online_clustering.py        ← DBSCAN logic
+```bash
+pip install -r requirements.txt
 ```
 
 ---
 
-## 3. Bước 1 — Định nghĩa Contract với Protocol Buffers
+## 3. Bước 1 — Định nghĩa hợp đồng (.proto)
 
-File `proto/engine.proto` là **contract** giữa client và server. Cả hai bên đều generate code từ file này.
+**File:** `proto/engine.proto`
 
-```protobuf
+```proto
 syntax = "proto3";
+
 package alarm_clustering;
 
-// ── 1. Khai báo Service và RPC methods ──────────────────────────
+// ── Service ─────────────────────────────────────────────────────────────────
 service AlarmClusteringService {
     rpc AnalyzeOnlineAlarmCluster(AnalyzeOnlineAlarmClusterRequest)
         returns (OnlineAlarmClusterReport);
 }
 
-// ── 2. Định nghĩa Request messages ──────────────────────────────
+// ── Request ──────────────────────────────────────────────────────────────────
 message AlarmRecord {
-    string _source_id         = 1;   // field number (bắt buộc, không đổi)
+    string _source_id         = 1;
     string managed_objects    = 2;
     string alarmType          = 3;
     string probable_cause     = 4;
@@ -101,498 +103,599 @@ message AlarmRecord {
 message AnalyzeOnlineAlarmClusterRequest {
     string requestId                  = 1;
     string system                     = 2;
-    repeated AlarmRecord alarmRecords = 3;  // repeated = list/array
+    repeated AlarmRecord alarmRecords = 3;
 }
 
-// ── 3. Định nghĩa Response messages ─────────────────────────────
+// ── Response ─────────────────────────────────────────────────────────────────
 message OnlineAlarmClusterResult {
     string _source_id = 1;
-    int32  clusterId  = 2;   // -2=OOV, -1=noise, 0+=cluster
+    int32  clusterId  = 2;
     float  confidence = 3;
 }
 
 message OnlineAlarmClusterReport {
     string requestId                          = 1;
     string reportType                         = 2;
-    string status                             = 3;   // OK | WARN | ERROR
+    string status                             = 3;
     string message                            = 4;
     repeated OnlineAlarmClusterResult results = 5;
 }
 ```
 
-### Quy tắc viết `.proto`
+### Giải thích các thành phần trong `.proto`
 
-| Quy tắc | Lý do |
-|---------|-------|
-| Field number không bao giờ thay đổi | Protobuf dùng number để encode, không dùng tên |
-| Chỉ thêm field mới, không xoá | Backward compatibility |
-| `repeated` = list | Tương đương `List[T]` trong Python |
-| Dùng `string` cho timestamp | Tránh timezone bugs; parse phía app |
-| `syntax = "proto3"` | Tất cả field đều optional, default = zero value |
+| Thành phần | Vai trò |
+|-----------|---------|
+| `syntax = "proto3"` | Phiên bản Protocol Buffers |
+| `package alarm_clustering` | Namespace — ảnh hưởng tên service đăng ký: `"alarm_clustering.AlarmClusteringService"` |
+| `service` | Khai báo gRPC service và các RPC method |
+| `rpc ... returns (...)` | Một RPC method: unary request → unary response |
+| `message` | Định nghĩa kiểu dữ liệu (tương đương class/struct) |
+| `repeated` | Mảng (list) các phần tử |
+| `int32`, `float`, `string` | Scalar types của Protobuf |
+
+> **Lưu ý BetterProto:** Field `_source_id` trong `.proto` có dấu gạch dưới ở đầu.  
+> BetterProto sẽ **tự động strip** dấu gạch dưới đó → trong Python là `source_id`.
 
 ---
 
-## 4. Bước 2 — Generate Python Stubs
+## 4. Bước 2 — Sinh Python stubs
 
-Từ một file `.proto`, `grpc_tools.protoc` sinh ra **hai file Python**:
+### Script tự động: `generate_betterproto.py`
+
+```python
+import subprocess, sys
+from pathlib import Path
+
+ROOT      = Path(__file__).parent
+PROTO_DIR = ROOT / "proto"
+OUT_DIR   = ROOT / "proto_betterproto"
+
+def generate() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "grpc_tools.protoc",
+        f"--proto_path={ROOT}",                    # ← root để import đúng package
+        f"--python_betterproto_out={OUT_DIR}",      # ← plugin betterproto
+        str(PROTO_DIR / "engine.proto"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("STDERR:", result.stderr)
+        sys.exit(result.returncode)
+    print("Done →", OUT_DIR)
+
+if __name__ == "__main__":
+    generate()
+```
 
 ```bash
-python -m grpc_tools.protoc \
-    -I proto \                        # thư mục chứa .proto
-    --python_out=proto \              # output cho message classes
-    --grpc_python_out=proto \         # output cho stub + servicer
-    proto/engine.proto
+python generate_betterproto.py
 ```
 
-**Kết quả:**
+### Output sinh ra: `proto_betterproto/engine.py`
 
-```
-proto/engine_pb2.py         ← Các class: AlarmRecord, AnalyzeOnlineAlarmClusterRequest, ...
-proto/engine_pb2_grpc.py    ← AlarmClusteringServiceStub (client)
-                               AlarmClusteringServiceServicer (server base class)
-                               add_AlarmClusteringServiceServicer_to_server()
-```
+BetterProto sinh ra:
+- **`@dataclass` message classes** — `AlarmRecord`, `AnalyzeOnlineAlarmClusterRequest`, `OnlineAlarmClusterResult`, `OnlineAlarmClusterReport`
+- **`AlarmClusteringServiceBase`** — abstract base class, override các method này để implement logic
+- **`AlarmClusteringServiceStub`** — dùng ở phía **client** để gọi RPC
 
-> **Lưu ý**: Không bao giờ sửa tay hai file generated này. Mọi thay đổi contract → sửa `.proto` → re-generate.
+### Ký hiệu tên field sau khi sinh (Quan trọng!)
 
-### Fix import trong generated stub
-
-`grpc_tools.protoc` sinh ra `import engine_pb2` (bare import). Khi `proto/` là một Python package, cần patch:
-
-```python
-# proto/engine_pb2_grpc.py (dòng 6) — đã được patch:
-try:
-    from proto import engine_pb2 as engine__pb2
-except ImportError:
-    import engine_pb2 as engine__pb2  # fallback khi proto/ trên sys.path
-```
-
-Và thêm `proto/__init__.py` để Python nhận `proto/` là package:
-
-```python
-# proto/__init__.py
-# Makes proto/ a Python package so relative imports within generated stubs work.
-```
+| Proto field | BetterProto Python attribute |
+|-------------|------------------------------|
+| `_source_id` | `source_id` *(strip leading `_`)* |
+| `requestId` | `request_id` *(camelCase → snake_case)* |
+| `alarmRecords` | `alarm_records` |
+| `clusterId` | `cluster_id` |
+| `reportType` | `report_type` |
 
 ---
 
-## 5. Bước 3 — Implement Servicer (Business Logic)
+## 5. Bước 3 — Triển khai Servicer
 
-Servicer là class kế thừa từ **base class được generated**, override từng RPC method.
+**File:** `server_betterproto.py`
+
+### Import stubs
 
 ```python
-# server.py
-import proto.engine_pb2      as pb2
-import proto.engine_pb2_grpc as pb2_grpc
-from embedder          import Embedder
-from online_clustering import cluster_online
+from proto_betterproto.engine import (
+    AlarmClusteringServiceBase,           # ← base class để kế thừa
+    AnalyzeOnlineAlarmClusterRequest,     # ← type hint cho request
+    OnlineAlarmClusterReport,             # ← type hint cho response
+    OnlineAlarmClusterResult,
+)
+```
 
-class AlarmClusteringServicer(pb2_grpc.AlarmClusteringServiceServicer):
+### Kế thừa `ServiceBase` và implement RPC method
+
+```python
+class AlarmClusteringServicer(AlarmClusteringServiceBase):
     """
-    Implement 1 method cho mỗi rpc trong .proto
+    - Kế thừa AlarmClusteringServiceBase (do BetterProto sinh ra).
+    - Override từng RPC method được khai báo trong .proto.
+    - Các method phải là 'async def' (BetterProto dùng asyncio).
+    - KHÔNG cần tham số 'context' như trong grpc_tools classic.
     """
 
     def __init__(self, model_dir: str) -> None:
-        # Load embedding model một lần duy nhất (singleton)
+        # Khởi tạo dependencies (embedder, model, DB connection, ...)
         self._embedder = Embedder.get_instance(model_dir)
 
-    # Tên method phải khớp chính xác với tên rpc trong .proto
-    def AnalyzeOnlineAlarmCluster(
+    async def analyze_online_alarm_cluster(
         self,
-        request: pb2.AnalyzeOnlineAlarmClusterRequest,  # typed từ generated code
-        context: grpc.ServicerContext,                   # dùng để set error code
-    ) -> pb2.OnlineAlarmClusterReport:
+        request: AnalyzeOnlineAlarmClusterRequest,
+    ) -> OnlineAlarmClusterReport:
+        # ── Đọc dữ liệu từ request (snake_case) ──────────────────────
+        request_id = request.request_id          # requestId trong proto
+        alarms     = request.alarm_records       # alarmRecords trong proto
 
-        # 1. Validate
-        if len(request.alarmRecords) == 0:
-            return pb2.OnlineAlarmClusterReport(
-                requestId  = request.requestId,
-                status     = "ERROR",
-                message    = "Request contains no alarm records.",
+        # ── Xử lý logic ───────────────────────────────────────────────
+        if not alarms:
+            return OnlineAlarmClusterReport(
+                request_id  = request_id,
+                report_type = "ONLINE_CLUSTER",
+                status      = "ERROR",
+                message     = "Request contains no alarm records.",
+                results     = [],
             )
 
-        # 2. Tokenise & embed
-        records = []
-        for alarm in request.alarmRecords:
-            token  = f"{alarm.managed_objects}|{alarm.probable_cause}"
-            vector = self._embedder.lookup(token)   # None nếu OOV
-            records.append({
-                "source_id": alarm._source_id,
-                "vector":    vector,
-            })
+        # Chạy blocking I/O trong thread pool để không block event loop
+        loop = asyncio.get_event_loop()
+        cluster_result = await loop.run_in_executor(None, cluster_online, records)
 
-        # 3. Cluster
-        result = cluster_online(records)
-
-        # 4. Build và trả về response message
-        return pb2.OnlineAlarmClusterReport(
-            requestId  = request.requestId,
-            reportType = "ONLINE_CLUSTER",
-            status     = "OK",
-            message    = f"{result.n_clusters} clusters found",
-            results    = [
-                pb2.OnlineAlarmClusterResult(
-                    _source_id = item.source_id,
-                    clusterId  = item.cluster_id,
-                    confidence = item.confidence,
-                )
-                for item in result.items
-            ],
+        # ── Trả về response ───────────────────────────────────────────
+        return OnlineAlarmClusterReport(
+            request_id  = request_id,
+            report_type = "ONLINE_CLUSTER",
+            status      = "OK",
+            message     = f"Clustered {len(alarms)} alarms",
+            results     = [...],
         )
 ```
 
-### Anatomy của một Servicer method
+### Các nguyên tắc quan trọng khi implement Servicer
 
-```
-def AnalyzeOnlineAlarmCluster(self, request, context):
-                                     ▲            ▲
-                    Protobuf message ┘            │
-                    (typed, deserialized auto)    │
-                                                  └─ grpc.ServicerContext
-                                                     dùng để:
-                                                     - context.set_code(grpc.StatusCode.INTERNAL)
-                                                     - context.set_details("error message")
-                                                     - context.is_active() → check nếu client cancel
-```
+| Quy tắc | Lý do |
+|---------|-------|
+| Method phải là `async def` | BetterProto dùng `grpc.aio` (asyncio) |
+| Không có `context` parameter | BetterProto ẩn đi, dùng exception thay thế |
+| Field name là **snake_case** | BetterProto tự chuyển từ camelCase |
+| Tên method là **snake_case** | `AnalyzeOnlineAlarmCluster` → `analyze_online_alarm_cluster` |
+| Dùng `await loop.run_in_executor()` | Chạy CPU-bound / blocking code trong thread pool |
 
 ---
 
 ## 6. Bước 4 — Khởi động Server
 
+### `grpc.aio.server` — async native server
+
 ```python
-# server.py
-from concurrent import futures
 import grpc
+import grpc.aio
+import asyncio
 
-def serve(port: int, model_dir: str, max_workers: int, health_port: int):
+async def _serve_async(
+    port: int,
+    model_dir: str,
+    ready_event: threading.Event,
+) -> None:
 
-    # 1. Tạo gRPC server với thread pool
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max_workers),
+    # 1. Tạo servicer instance
+    servicer = AlarmClusteringServicer(model_dir)
+
+    # 2. Tạo gRPC server với options
+    server = grpc.aio.server(
         options=[
             ("grpc.max_receive_message_length", 64 * 1024 * 1024),  # 64 MB
             ("grpc.max_send_message_length",    64 * 1024 * 1024),
         ],
     )
 
-    # 2. Đăng ký servicer vào server
-    servicer = AlarmClusteringServicer(model_dir)
-    pb2_grpc.add_AlarmClusteringServiceServicer_to_server(servicer, server)
-    #         ▲ hàm này được generate tự động từ .proto
+    # 3. Đăng ký handlers (BetterProto cách)
+    #    servicer.__mapping__() trả về dict {method_name: handler}
+    handlers = servicer.__mapping__()
+    generic_handler = grpc.method_service_handler(
+        "alarm_clustering.AlarmClusteringService", handlers
+    )
+    server.add_generic_rpc_handlers([generic_handler])
 
-    # 3. Bind port và start
-    server.add_insecure_port(f"[::]:{port}")  # [::] = lắng nghe mọi interface
-    server.start()
+    # 4. Bind port và start
+    server.add_insecure_port(f"[::]:{port}")
+    await server.start()
 
-    # 4. Graceful shutdown khi nhận SIGTERM/SIGINT
-    def _shutdown(signum, frame):
-        server.stop(grace=5)   # chờ tối đa 5s cho requests đang xử lý
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT,  _shutdown)
+    # 5. Signal readiness
+    ready_event.set()
 
-    # 5. Block main thread
-    while True:
-        time.sleep(1)
+    # 6. Chờ đến khi shutdown
+    await server.wait_for_termination()
 ```
 
-### Thread model của gRPC server
+### Đăng ký handler: classic vs betterproto
 
-```
-main thread ──► server.start()   (non-blocking)
-                    │
-                    ├── Thread 1 ──► AnalyzeOnlineAlarmCluster (request A)
-                    ├── Thread 2 ──► AnalyzeOnlineAlarmCluster (request B)
-                    └── Thread N ──► ...    (max_workers = 10)
-```
-
-Mỗi RPC call được xử lý trong một thread riêng từ pool. `Embedder` dùng singleton pattern nên được share an toàn (read-only sau khi load).
-
----
-
-## 7. Bước 5 — Implement Client
-
+**Classic (`grpc_tools.protoc`):**
 ```python
-# test_client.py
-import grpc
-import proto.engine_pb2      as pb2
-import proto.engine_pb2_grpc as pb2_grpc
+# server.py — dùng hàm được sinh tự động
+pb2_grpc.add_AlarmClusteringServiceServicer_to_server(servicer, server)
+```
 
-# 1. Tạo channel (kết nối tới server)
-channel = grpc.insecure_channel("localhost:50051")
-
-# 2. Tạo stub (proxy object sinh code tự động)
-stub = pb2_grpc.AlarmClusteringServiceStub(channel)
-
-# 3. Build request message
-request = pb2.AnalyzeOnlineAlarmClusterRequest(
-    requestId    = "req-001",
-    system       = "IMS_CORE",
-    alarmRecords = [
-        pb2.AlarmRecord(
-            _source_id         = "alarm-001",
-            managed_objects    = "vdu_csdb.vnfc_csdb1",
-            alarmType          = "LINK_TO_DNSGW_DOWN",
-            probable_cause     = "LINK_TO_DNSGW_DOWN",
-            perceived_severity = "MAJOR",
-            state              = "ACTIVE",
-            created_at         = "2024-01-15T10:00:00Z",
-        ),
-        # ... thêm alarm records
-    ],
+**BetterProto:**
+```python
+# server_betterproto.py — dùng __mapping__() generic
+handlers = servicer.__mapping__()
+generic_handler = grpc.method_service_handler(
+    "alarm_clustering.AlarmClusteringService",  # ← phải khớp với package.ServiceName
+    handlers
 )
-
-# 4. Gọi RPC — blocking call (giống gọi hàm local)
-report = stub.AnalyzeOnlineAlarmCluster(request)
-
-# 5. Đọc response
-print(f"Status : {report.status}")
-print(f"Message: {report.message}")
-for r in report.results:
-    print(f"  {r._source_id} → cluster={r.clusterId}  conf={r.confidence:.3f}")
-
-# 6. Đóng channel khi xong
-channel.close()
+server.add_generic_rpc_handlers([generic_handler])
 ```
 
-### Secure Channel (production)
+> **Tên service string:** Luôn là `"{package}.{ServiceName}"` — khớp với khai báo trong `.proto`.  
+> Project này: `"alarm_clustering.AlarmClusteringService"`
+
+### Các gRPC server options phổ biến
 
 ```python
-# TLS — dùng trong production thay cho insecure_channel
-with open("ca.crt", "rb") as f:
-    creds = grpc.ssl_channel_credentials(f.read())
-
-channel = grpc.secure_channel("alarm-cluster-engine:50051", creds)
+options = [
+    ("grpc.max_receive_message_length", 64 * 1024 * 1024),  # 64 MB
+    ("grpc.max_send_message_length",    64 * 1024 * 1024),
+    ("grpc.keepalive_time_ms",          10_000),             # 10s
+    ("grpc.keepalive_timeout_ms",        5_000),             # 5s
+    ("grpc.keepalive_permit_without_calls", True),
+    ("grpc.http2.min_recv_ping_interval_without_data_ms", 5_000),
+]
 ```
 
 ---
 
-## 8. Luồng xử lý request đầy đủ
+## 7. Bước 5 — HTTP Health Probe
 
-```
-Client                              Server
-  │                                   │
-  │  AnalyzeOnlineAlarmClusterRequest │
-  │ ─────────────────────────────────►│
-  │  (Protobuf binary, HTTP/2 frame)  │
-  │                                   ├─ Deserialize → pb2.AnalyzeOnlineAlarmClusterRequest
-  │                                   ├─ AlarmClusteringServicer.AnalyzeOnlineAlarmCluster()
-  │                                   │     ├─ Validate (empty check)
-  │                                   │     ├─ Tokenise alarms
-  │                                   │     │   token = managed_objects|probable_cause
-  │                                   │     ├─ Embedder.lookup(token)
-  │                                   │     │   ├─ In vocab  → vector (22-dim)
-  │                                   │     │   └─ OOV       → None
-  │                                   │     ├─ cluster_online(records)
-  │                                   │     │   ├─ auto_eps() via k-NN
-  │                                   │     │   ├─ DBSCAN.fit_predict()
-  │                                   │     │   └─ density_confidence()
-  │                                   │     └─ Build OnlineAlarmClusterReport
-  │                                   ├─ Serialize → Protobuf binary
-  │  OnlineAlarmClusterReport        │
-  │ ◄─────────────────────────────────│
-  │                                   │
-```
-
----
-
-## 9. Error Handling & Status Codes
-
-### Application-level errors (dùng `status` field trong response)
-
-Đây là pattern được dùng trong project này — trả về response hợp lệ kèm status code riêng:
-
-| `status` | Nghĩa | Ví dụ |
-|----------|-------|-------|
-| `"OK"` | Thành công | 2 clusters tìm được |
-| `"WARN"` | Thành công nhưng có cảnh báo | < `min_samples` alarms → 0 clusters |
-| `"ERROR"` | Lỗi nghiệp vụ | Tất cả alarms đều OOV |
-
-### gRPC-level errors (dùng `context`)
-
-Cho các lỗi infrastructure / unexpected exceptions:
+Cần thiết cho **Kubernetes liveness/readiness probes**.  
+Chạy trên một thread riêng để độc lập với asyncio event loop của gRPC.
 
 ```python
-def AnalyzeOnlineAlarmCluster(self, request, context):
-    try:
-        result = cluster_online(records)
-    except Exception as exc:
-        # Set gRPC status code — client sẽ nhận RpcError
-        context.set_code(grpc.StatusCode.INTERNAL)
-        context.set_details(f"Clustering error: {exc}")
-        return pb2.OnlineAlarmClusterReport(status="ERROR", ...)
-```
-
-**Các StatusCode thường dùng:**
-
-| Code | HTTP tương đương | Khi nào dùng |
-|------|-----------------|--------------|
-| `OK` | 200 | Thành công |
-| `INVALID_ARGUMENT` | 400 | Request không hợp lệ |
-| `NOT_FOUND` | 404 | Resource không tồn tại |
-| `INTERNAL` | 500 | Lỗi server không mong đợi |
-| `UNAVAILABLE` | 503 | Server chưa sẵn sàng |
-
-### Xử lý lỗi phía Client
-
-```python
-try:
-    report = stub.AnalyzeOnlineAlarmCluster(request)
-except grpc.RpcError as e:
-    print(f"gRPC error: {e.code()} — {e.details()}")
-```
-
----
-
-## 10. Health Probes cho Kubernetes
-
-gRPC server không có HTTP natively, nên cần thêm HTTP health endpoint riêng để K8s có thể probe:
-
-```python
-# server.py
-import http.server, threading
+import http.server
+import threading
 
 class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    # Shared event — được set khi gRPC server sẵn sàng
     ready_event: threading.Event = threading.Event()
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/live":
-            # Liveness: process còn sống?
+            # Liveness: process đang chạy → luôn 200
             self._respond(200, b"LIVE")
-        elif self.path in ("/ready", "/health"):
-            # Readiness: embedder đã load xong và gRPC đang up?
-            code = 200 if self.ready_event.is_set() else 503
-            self._respond(code, b"READY" if code == 200 else b"NOT READY")
 
-    def _respond(self, code, body):
+        elif self.path in ("/ready", "/health"):
+            # Readiness: chỉ 200 khi gRPC server đã start xong
+            if self.ready_event.is_set():
+                self._respond(200, b"READY")
+            else:
+                self._respond(503, b"NOT READY")
+        else:
+            self._respond(404, b"NOT FOUND")
+
+    def _respond(self, code: int, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args): pass  # suppress logs
+    def log_message(self, fmt, *args) -> None:
+        pass  # Tắt access log cho gọn
 
-def serve(...):
+
+def _start_health_server(port: int, ready_event: threading.Event) -> None:
+    _HealthHandler.ready_event = ready_event
+    httpd = http.server.HTTPServer(("0.0.0.0", port), _HealthHandler)
+    httpd.serve_forever()   # blocking — phải chạy trong thread riêng
+
+
+def serve(port, model_dir, max_workers, health_port):
     ready_event = threading.Event()
 
-    # Start health server TRƯỚC gRPC → /live trả 200 ngay
-    threading.Thread(
-        target=lambda: http.server.HTTPServer(("0.0.0.0", 8080), _HealthHandler).serve_forever(),
-        daemon=True,
-    ).start()
+    # Start HTTP health server trong daemon thread
+    health_thread = threading.Thread(
+        target=_start_health_server,
+        args=(health_port, ready_event),
+        daemon=True,         # ← tự kết thúc khi main thread dừng
+        name="health-http",
+    )
+    health_thread.start()
 
-    server = grpc.server(...)
+    # Start gRPC server (set ready_event bên trong khi server đã start)
+    asyncio.run(_serve_async(port, model_dir, ready_event))
+```
+
+### Luồng probe sequence
+
+```
+Process start
+     │
+     ▼
+health_thread.start()     → /live  = 200 (ngay lập tức)
+     │
+     ▼
+gRPC server.start()
+     │
+     ▼
+ready_event.set()         → /ready = 200 (sau khi gRPC sẵn sàng)
+```
+
+---
+
+## 8. Bước 6 — Graceful Shutdown
+
+### Với `grpc.aio` (asyncio) — dùng `add_signal_handler`
+
+```python
+async def _serve_async(...):
+    ...
+    await server.start()
+
+    loop = asyncio.get_event_loop()
+
+    def _on_signal():
+        logger.info("Shutdown signal — stopping...")
+        asyncio.ensure_future(server.stop(grace=5))  # 5s grace period
+
+    loop.add_signal_handler(signal.SIGTERM, _on_signal)
+    loop.add_signal_handler(signal.SIGINT,  _on_signal)
+
+    await server.wait_for_termination()
+```
+
+### Với `grpc.server` sync (classic) — dùng `signal.signal`
+
+```python
+def serve(...):
+    ...
     server.start()
+    _stop_event = [False]
 
-    # Signal /ready sau khi gRPC đã start
-    ready_event.set()
+    def _shutdown(signum, frame):
+        _stop_event[0] = True
+        server.stop(grace=5)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+
+    while not _stop_event[0]:
+        time.sleep(1)
 ```
 
-**Mapping sang K8s probes** (`k8s/deployment.yaml`):
+> **Tại sao `grace=5`?**  
+> Cho phép các RPC đang xử lý có 5 giây để hoàn thành trước khi server đóng cứng.  
+> Rất quan trọng trong môi trường Kubernetes (rolling update, pod eviction).
 
-```yaml
-livenessProbe:             # Restart pod nếu process treo
-  httpGet:
-    path: /live
-    port: 8080
-  initialDelaySeconds: 10
+---
 
-readinessProbe:            # Không route traffic cho đến khi /ready = 200
-  httpGet:
-    path: /ready
-    port: 8080
-  initialDelaySeconds: 5
+## 9. Bước 7 — CLI Entry-Point
 
-startupProbe:              # Cho thêm 60s để load model lần đầu
-  httpGet:
-    path: /ready
-    port: 8080
-  failureThreshold: 12
-  periodSeconds: 5
+```python
+import argparse
+import os
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Alarm Cluster Engine — gRPC Server (BetterProto)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--port", type=int,
+        default=int(os.environ.get("GRPC_PORT", 50051)),
+        help="gRPC listen port",
+    )
+    parser.add_argument(
+        "--health-port", type=int,
+        default=int(os.environ.get("HEALTH_PORT", 8080)),
+        help="HTTP health probe port",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=os.environ.get("MODEL_DIR", "models"),
+        help="Directory containing model files",
+    )
+    parser.add_argument(
+        "--workers", type=int,
+        default=int(os.environ.get("MAX_WORKERS", 10)),
+        help="Thread-executor size for blocking ops",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    serve(
+        port        = args.port,
+        model_dir   = args.model_dir,
+        max_workers = args.workers,
+        health_port = args.health_port,
+    )
+```
+
+### Chạy server
+
+```bash
+# Mặc định
+python server_betterproto.py
+
+# Tùy chỉnh port
+python server_betterproto.py --port 50052 --health-port 8081
+
+# Qua environment variable
+GRPC_PORT=50052 MODEL_DIR=/data/models python server_betterproto.py
 ```
 
 ---
 
-## 11. Chạy và kiểm thử
-
-### Chạy local
-
-```bash
-# Terminal 1 — Start server
-python server.py --port 50051 --health-port 8080 --model-dir models
-
-# Terminal 2 — Kiểm tra health
-curl http://localhost:8080/live    # → LIVE
-curl http://localhost:8080/ready   # → READY
-
-# Terminal 2 — Gửi test requests (4 scenarios)
-python test_client.py --scenario all
-
-# Chạy một scenario cụ thể
-python test_client.py --scenario normal
-python test_client.py --scenario oov
-python test_client.py --scenario small_batch
-python test_client.py --scenario empty
-```
-
-### CLI options của server
-
-```bash
-python server.py --help
-
-# Options:
-#   --port          gRPC port          (default: 50051, env: GRPC_PORT)
-#   --health-port   HTTP probe port    (default: 8080,  env: HEALTH_PORT)
-#   --model-dir     embeddings dir     (default: models, env: MODEL_DIR)
-#   --workers       thread pool size   (default: 10,    env: MAX_WORKERS)
-```
-
-### Output mong đợi khi test thành công
+## 10. Sơ đồ luồng hoàn chỉnh
 
 ```
-============================================================
-Alarm Cluster Engine — Test Client
-  Server: localhost:50051
-============================================================
-
-[Scenario: NORMAL] Sending a realistic alarm batch…
-────────────────────────────────────────────────────────────
-  requestId  : req-normal-001
-  status     : OK
-  message    : Clustered 10 alarms → 2 clusters | 2 noise | 0 OOV | ...
-  results    : 10 items
-  Cluster distribution:
-       Noise (id= -1)  :  2 alarms
-          C0 (id=  0)  :  4 alarms
-          C1 (id=  1)  :  4 alarms
-────────────────────────────────────────────────────────────
-
-[Scenario: OOV] → status: ERROR  (all clusterId = -2)
-[Scenario: SMALL BATCH] → status: WARN  (< min_samples)
-[Scenario: EMPTY] → status: ERROR  (no records)
+engine.proto
+     │
+     │  python generate_betterproto.py
+     ▼
+proto_betterproto/
+└── engine.py
+    ├── AlarmRecord               (@dataclass)
+    ├── AnalyzeOnlineAlarmClusterRequest  (@dataclass)
+    ├── OnlineAlarmClusterResult  (@dataclass)
+    ├── OnlineAlarmClusterReport  (@dataclass)
+    ├── AlarmClusteringServiceBase    ← server kế thừa
+    └── AlarmClusteringServiceStub    ← client dùng
+         │
+         ▼
+server_betterproto.py
+│
+├── _HealthHandler (http.server)
+│   ├── GET /live   → 200 LIVE
+│   ├── GET /ready  → 200 READY | 503 NOT READY
+│   └── GET /health → alias /ready
+│
+├── AlarmClusteringServicer(AlarmClusteringServiceBase)
+│   └── async analyze_online_alarm_cluster(request) → response
+│       ├── parse request.alarm_records
+│       ├── embed tokens
+│       └── await loop.run_in_executor(cluster_online)
+│
+└── serve()
+    ├── threading.Thread(_start_health_server)   ← port 8080
+    └── asyncio.run(_serve_async())              ← port 50051
+        ├── grpc.aio.server(options=[...])
+        ├── servicer.__mapping__() → register handlers
+        ├── server.add_insecure_port("[::]:{port}")
+        ├── await server.start()
+        ├── ready_event.set()
+        ├── loop.add_signal_handler(SIGTERM/SIGINT)
+        └── await server.wait_for_termination()
 ```
 
 ---
 
-## Tóm tắt quy trình xây dựng
+## 11. Bảng so sánh classic vs betterproto
 
+| Tiêu chí | `grpc_tools.protoc` (classic) | `betterproto` (modern) |
+|----------|-------------------------------|------------------------|
+| **Sinh file** | `engine_pb2.py` + `engine_pb2_grpc.py` | `proto_betterproto/engine.py` |
+| **Message type** | Raw descriptor class | `@dataclass` |
+| **Field access** | `request.requestId` (camelCase) | `request.request_id` (snake_case) |
+| **Field `_source_id`** | `alarm._source_id` | `alarm.source_id` *(strip `_`)* |
+| **Servicer base** | `AlarmClusteringServiceServicer` | `AlarmClusteringServiceBase` |
+| **RPC method** | `def AnalyzeOnlineAlarmCluster(self, request, context)` | `async def analyze_online_alarm_cluster(self, request)` |
+| **Register handler** | `pb2_grpc.add_...Servicer_to_server(s, server)` | `servicer.__mapping__()` |
+| **gRPC runtime** | `grpc.server(ThreadPoolExecutor(...))` | `grpc.aio.server(...)` |
+| **Shutdown** | `signal.signal()` + polling loop | `loop.add_signal_handler()` + `asyncio.ensure_future()` |
+| **IDE support** | Kém (no type hints) | Tốt (typed dataclass) |
+| **Async native** | Không | **Có** |
+| **Context object** | Có (`grpc.ServicerContext`) | Không cần (exception-based) |
+
+---
+
+## 12. Các lỗi thường gặp
+
+### ❌ `ModuleNotFoundError: No module named 'proto_betterproto'`
+
+**Nguyên nhân:** Chưa chạy `generate_betterproto.py`.
+
+```bash
+python generate_betterproto.py
 ```
-1. Viết engine.proto          → định nghĩa API contract
-         │
-         ▼
-2. grpc_tools.protoc          → sinh engine_pb2.py + engine_pb2_grpc.py
-         │
-         ▼
-3. Implement Servicer          → kế thừa AlarmClusteringServiceServicer
-   (server.py)                    override AnalyzeOnlineAlarmCluster()
-         │
-         ▼
-4. Đăng ký & start server     → grpc.server() → add_servicer → start()
-         │
-         ▼
-5. Implement Client            → insecure_channel() → Stub → gọi RPC
-   (test_client.py)
-         │
-         ▼
-6. Thêm health probe           → HTTP /live /ready trên port 8080
-   (cho Kubernetes)
+
+---
+
+### ❌ `AttributeError: 'AlarmRecord' object has no attribute '_source_id'`
+
+**Nguyên nhân:** BetterProto strip leading underscore.
+
+```python
+# ❌ Sai
+alarm._source_id
+
+# ✅ Đúng
+alarm.source_id
 ```
+
+---
+
+### ❌ `AttributeError: 'AnalyzeOnlineAlarmClusterRequest' has no attribute 'requestId'`
+
+**Nguyên nhân:** BetterProto chuyển camelCase → snake_case.
+
+```python
+# ❌ Sai
+request.requestId
+request.alarmRecords
+
+# ✅ Đúng
+request.request_id
+request.alarm_records
+```
+
+---
+
+### ❌ `RuntimeError: This event loop is already running`
+
+**Nguyên nhân:** Gọi `asyncio.run()` trong môi trường đã có event loop (Jupyter, FastAPI...).
+
+```python
+# ✅ Dùng trong môi trường đã có event loop
+import nest_asyncio
+nest_asyncio.apply()
+asyncio.run(main())
+```
+
+---
+
+### ❌ `grpc._channel._InactiveRpcError: StatusCode.UNAVAILABLE`
+
+**Nguyên nhân:** Server chưa start khi client kết nối, hoặc sai port.
+
+```python
+# Kiểm tra health trước khi gọi
+import urllib.request
+resp = urllib.request.urlopen("http://localhost:8080/ready")
+assert resp.status == 200
+```
+
+---
+
+### ❌ `STDERR: --python_betterproto_out: protoc-gen-python_betterproto: Plugin not found`
+
+**Nguyên nhân:** `betterproto[compiler]` chưa được cài đúng, hoặc dùng `protoc` hệ thống thay vì `grpc_tools.protoc`.
+
+```bash
+# ✅ Luôn dùng grpc_tools.protoc qua Python
+python -m grpc_tools.protoc --python_betterproto_out=... proto/engine.proto
+
+# ❌ Không dùng protoc hệ thống
+protoc --python_betterproto_out=... proto/engine.proto
+```
+
+---
+
+### ❌ Server đăng ký sai tên service
+
+**Nguyên nhân:** String tên service không khớp với `package` trong `.proto`.
+
+```python
+# proto: package alarm_clustering; service AlarmClusteringService { ... }
+
+# ✅ Đúng
+generic_handler = grpc.method_service_handler(
+    "alarm_clustering.AlarmClusteringService",  # package.ServiceName
+    handlers
+)
+
+# ❌ Sai
+generic_handler = grpc.method_service_handler(
+    "AlarmClusteringService",  # thiếu package prefix
+    handlers
+)
+```
+
+---
+
+*Tài liệu này phản ánh codebase tại `f:\AI\Clustering\AlarmClusterEngine` — cập nhật lần cuối: 2026-05-19.*
