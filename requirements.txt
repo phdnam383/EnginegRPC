@@ -1,5 +1,6 @@
 grpcio>=1.62.0
 grpcio-tools>=1.62.0
+betterproto[compiler]>=0.3.1
 numpy>=1.24.0
 scikit-learn>=1.3.0
 pandas>=2.0.0
