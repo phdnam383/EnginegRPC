@@ -8,7 +8,5 @@ metadata:
   labels:
     app: alarm-cluster-engine
 data:
-  GRPC_PORT:    "50051"
-  HEALTH_PORT:  "8080"
-  MODEL_DIR:    "/app/models"
-  MAX_WORKERS:  "10"
+  GRPC_PORT:  "50051"
+  MODEL_DIR:  "/app/models"

@@ -17,14 +17,7 @@ spec:
   selector:
     app: alarm-cluster-engine
   ports:
-    # gRPC port — used by MDAF Logic / internal callers
     - name: grpc
       port: 50051
       targetPort: grpc
-      protocol: TCP
-
-    # HTTP health port — optional, useful for external monitoring dashboards
-    - name: health
-      port: 8080
-      targetPort: health
       protocol: TCP

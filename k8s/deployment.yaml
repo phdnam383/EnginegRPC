@@ -54,9 +54,6 @@ spec:
             - name: grpc
               containerPort: 50051
               protocol: TCP
-            - name: health
-              containerPort: 8080
-              protocol: TCP
 
           # ── Environment from ConfigMap ────────────────────────────────────────
           envFrom:
@@ -73,36 +70,28 @@ spec:
               memory: "512Mi"
 
           # ── Liveness probe ────────────────────────────────────────────────────
-          # Restarts the pod if the process hangs (HTTP /live always 200 if alive)
           livenessProbe:
-            httpGet:
-              path: /live
-              port: health
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
-            timeoutSeconds: 5
 
           # ── Readiness probe ───────────────────────────────────────────────────
-          # Removes pod from Service endpoints until embedder is loaded & gRPC is up
           readinessProbe:
-            httpGet:
-              path: /ready
-              port: health
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
-            timeoutSeconds: 5
 
           # ── Startup probe ─────────────────────────────────────────────────────
-          # Gives up to 60s for the first startup (model loading) before liveness kicks in
+          # Cho tối đa 60s để load model trước khi liveness bắt đầu kiểm tra
           startupProbe:
-            httpGet:
-              path: /ready
-              port: health
+            tcpSocket:
+              port: grpc
             failureThreshold: 12
             periodSeconds: 5
-            timeoutSeconds: 5
 
           # ── Volume mount (optional — only needed with hot-swappable PVC model) ──
           # volumeMounts:
