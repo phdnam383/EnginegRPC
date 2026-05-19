@@ -27,8 +27,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Copy application source ───────────────────────────────────────────────────
-COPY proto/  proto/
-COPY *.py    ./
+COPY proto/            proto/
+COPY proto_betterproto/ proto_betterproto/
+COPY *.py              ./
 
 # ── Bake the pre-trained embedding model into the image ───────────────────────
 # Only embeddings.npz is needed at serving time (~215 KB).
@@ -36,16 +37,11 @@ COPY models/embeddings.npz models/embeddings.npz
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 ENV GRPC_PORT=50051 \
-    HEALTH_PORT=8080 \
-    MODEL_DIR=/app/models \
-    MAX_WORKERS=10
+    MODEL_DIR=/app/models
 
-# gRPC port + HTTP health probe port
-EXPOSE 50051 8080
+EXPOSE 50051
 
-# Non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser /app
 USER appuser
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-CMD ["python", "server.py"]
+CMD ["python", "server_betterproto.py"]
